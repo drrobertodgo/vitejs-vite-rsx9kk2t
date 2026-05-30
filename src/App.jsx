@@ -1032,7 +1032,7 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
   const runGeminiCall = async (promptBody, systemInstruction, jsonSchemaInput = null) => {
     // Conservé tu API Key original del archivo.
     // Si después de probar sigue fallando con 403/API_KEY_INVALID, genera una nueva en Google AI Studio.
-    const apiKey = "AIzaSyDXyhZs6x0hnLhWqqFWi0E4daUubNBIwkQ";
+    const apiKey = "AQ.Ab8RN6LCGnafIMY5WtvdPEmj3CjKNOxAGawM0f1JqFzXcRrbQA";
 
     // Modelos actuales recomendados para texto. La función prueba primero Flash y luego Flash-Lite.
     const modelsToTry = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
