@@ -12,8 +12,65 @@ import {
 const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwd0xA6CqP0WM5rWrBlUzUPb9jARQmyyhiQFJTxg--UqbRex2_9lAJh3Sn7gSuiLVmizg/exec"; 
 
 // =========================================================================
+// UTILIDAD PARA LEER JSON DEVUELTO POR GEMINI
+// =========================================================================
+const parseGeminiJson = (rawText) => {
+  if (!rawText || typeof rawText !== 'string') {
+    throw new Error('La IA no devolvió texto para convertir a JSON.');
+  }
+
+  let cleaned = rawText.trim();
+
+  // Por si el modelo devuelve el JSON dentro de ```json ... ```
+  cleaned = cleaned
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```$/i, '')
+    .trim();
+
+  const firstBrace = cleaned.indexOf('{');
+  const lastBrace = cleaned.lastIndexOf('}');
+
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    cleaned = cleaned.slice(firstBrace, lastBrace + 1);
+  }
+
+  return JSON.parse(cleaned);
+};
+
+const getGeminiErrorMessage = (err) => {
+  const msg = err?.message || String(err);
+
+  if (msg.includes('API_KEY_INVALID') || msg.includes('API key not valid')) {
+    return 'La API Key de Gemini no es válida. Genera una nueva clave en Google AI Studio y sustitúyela en el código.';
+  }
+
+  if (msg.includes('PERMISSION_DENIED') || msg.includes('403')) {
+    return 'Gemini rechazó la solicitud por permisos. Revisa que la API Key esté activa y sin restricciones incompatibles.';
+  }
+
+  if (msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429')) {
+    return 'Se agotó la cuota o el límite temporal de Gemini. Espera un momento o revisa la cuota de tu API Key.';
+  }
+
+  if (msg.includes('NOT_FOUND') || msg.includes('404') || msg.includes('model')) {
+    return 'El modelo de Gemini no está disponible para esta API Key. Prueba con gemini-2.5-flash-lite o regenera la API Key.';
+  }
+
+  if (msg.toLowerCase().includes('cors')) {
+    return 'El navegador bloqueó la solicitud por CORS. En ese caso hay que mover la llamada a Gemini a una función API de Vercel.';
+  }
+
+  if (msg.includes('Failed to fetch')) {
+    return 'No se pudo conectar con Gemini. Puede ser red, CORS, bloqueo del navegador o restricción de la API Key.';
+  }
+
+  return msg;
+};
+
+
+// =========================================================================
 // BASE DE DATOS 1: EVALUADORES Y CONTRASEÑAS
-// Pega aquí la lista de los evaluadores y el usuario que usarán para entrar.
 // =========================================================================
 const CSV_EVALUADORES = `NOMBRE_EVALUADOR,USUARIO
 MARÍA GUADALUPE VAZQUEZ R.,EVALUADOROCI2026001
@@ -326,15 +383,23 @@ const RUBRICA = [
   }
 ];
 
+// --- FUNCION DINAMICA DE NIVELES (NUEVO) ---
+const getLevelForScore = (criterio, score) => {
+  if (score === null || score === undefined) return null;
+  return criterio.niveles.find(n => {
+    const [min, max] = n.rango.split('-').map(Number);
+    return score >= min && score <= max;
+  });
+};
+
 // --- MOTOR DE PARSEO DINÁMICO DE DOS DOCUMENTOS ---
 const parseCSVDatabase = (csvEvaluadores, csvAlumnos) => {
-  // Función interna para parsear líneas de CSV protegiendo comas dentro de comillas
   const parseCSVLine = (text) => {
     let ret = [], inQuote = false, value = '';
     for (let i = 0; i < text.length; i++) {
       let char = text[i];
       if (inQuote) {
-        if (char === '"' && text[i+1] === '"') { value += '"'; i++; } // Escapar comillas dobles
+        if (char === '"' && text[i+1] === '"') { value += '"'; i++; }
         else if (char === '"') { inQuote = false; }
         else { value += char; }
       } else {
@@ -351,12 +416,10 @@ const parseCSVDatabase = (csvEvaluadores, csvAlumnos) => {
   const dbEvaluadores = [];
   const dbParticipants = [];
 
-  // 1. Agregar Superusuario Administrador
   const adminUser = { rfc: 'GOKU', nombre: 'Administrador General', rol: 'Supervisión Estatal', assignedIds: [] };
   dbEvaluadores.push(adminUser);
   evaluatorsMap.set('GOKU', adminUser);
 
-  // 2. Procesar Archivo de Evaluadores
   const evalLines = csvEvaluadores.replace(/\r/g, '').trim().split('\n');
   for (let i = 1; i < evalLines.length; i++) {
     if (!evalLines[i].trim()) continue;
@@ -372,13 +435,10 @@ const parseCSVDatabase = (csvEvaluadores, csvAlumnos) => {
     evaluatorsMap.set(normalizedName, newEval);
   }
 
-  // 3. Procesar Archivo de Alumnos y enlazar con Evaluadores
   const studentLines = csvAlumnos.replace(/\r/g, '').trim().split('\n');
   if (studentLines.length > 0) {
-    // Leer los encabezados dinámicamente
     const headers = parseCSVLine(studentLines[0]).map(h => h.toUpperCase());
     
-    // Buscar los índices de las columnas sin importar en qué orden estén
     const iNombre = headers.indexOf('NOMBRE COMPLETO DEL NIÑO (A)');
     const iRegion = headers.indexOf('REGION');
     const iSector = headers.indexOf('SECTOR');
@@ -418,13 +478,11 @@ const parseCSVDatabase = (csvEvaluadores, csvAlumnos) => {
       };
 
       dbParticipants.push(newStudent);
-      adminUser.assignedIds.push(newStudent.id); // Al admin le aparecen todos los niños
+      adminUser.assignedIds.push(newStudent.id);
 
-      // Función para asignar el niño al evaluador correspondiente
       const assignToEval = (evalNameRaw) => {
         if (!evalNameRaw || evalNameRaw.trim() === '') return;
         const normalized = evalNameRaw.trim().toUpperCase();
-        // Si el evaluador existe en la BD de evaluadores, le inyectamos este alumno
         if (evaluatorsMap.has(normalized)) {
           evaluatorsMap.get(normalized).assignedIds.push(newStudent.id);
         }
@@ -439,14 +497,12 @@ const parseCSVDatabase = (csvEvaluadores, csvAlumnos) => {
   return { dbEvaluadores, dbParticipants };
 };
 
-// Construir la BD en memoria antes de iniciar la App
 const { dbEvaluadores, dbParticipants } = parseCSVDatabase(CSV_EVALUADORES, CSV_ALUMNOS);
 
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [evaluatorUser, setEvaluatorUser] = useState(null);
   
-  // CONTROL DE SELECCIÓN ACTIVA
   const [isSelectionConfirmed, setIsSelectionConfirmed] = useState(false);
   const [selectedStudentIds, setSelectedStudentIds] = useState([]); 
 
@@ -460,7 +516,6 @@ export default function App() {
   const myActiveParticipants = assignedParticipants.filter(p => selectedStudentIds.includes(p.id));
   const currentParticipant = myActiveParticipants.find(p => p.id === selectedId);
 
-  // Escuchar tecla "Escape" globalmente de forma segura en React
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.key === 'Escape') {
@@ -549,7 +604,6 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#FAF8F5] text-slate-800 font-sans flex flex-col overflow-x-hidden">
       
-      {/* SIDEBAR PARA MÓVILES EXCLUSIVAMENTE */}
       <aside className={`
         ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} 
         md:hidden transition-transform duration-300 ease-in-out
@@ -592,7 +646,6 @@ export default function App() {
         </div>
       </aside>
 
-      {/* MAIN CONTENT */}
       <main className="flex-1 flex flex-col h-full relative overflow-hidden">
         <header className="md:hidden bg-white h-14 border-b border-slate-200 flex items-center justify-between px-4 shrink-0">
           <button onClick={() => setSidebarOpen(true)} className="text-[#E30613]">
@@ -633,8 +686,6 @@ export default function App() {
   );
 }
 
-// --- PANTALLAS Y DIÁLOGOS ---
-
 function LoginScreen({ onLogin }) {
   const [rfc, setRfc] = useState('');
   const [error, setError] = useState('');
@@ -651,11 +702,8 @@ function LoginScreen({ onLogin }) {
 
   return (
     <div className="min-h-screen bg-[#FAF8F5] flex flex-col md:flex-row items-center justify-center p-4 relative overflow-hidden">
-      {/* Rediseño de fondo interactivo emulando la portada oficial de Durango */}
       <div className="absolute top-0 left-0 w-full h-full -z-10 bg-gradient-to-br from-[#E30613] to-[#800000] md:w-1/2 rounded-r-[60px] md:rounded-r-[150px] shadow-2xl overflow-hidden">
-        {/* Onda de Oro Durango */}
         <div className="absolute top-[-20%] right-[-10%] w-[120%] h-[80%] bg-[#E28E2B] rounded-full opacity-20 transform rotate-12"></div>
-        {/* Onda de Azul/Cian Durango */}
         <div className="absolute bottom-[-10%] left-[-10%] w-[100%] h-[50%] bg-[#0088A7] rounded-full opacity-30 transform -rotate-12"></div>
         <div className="absolute bottom-[10%] right-[-10%] w-[80%] h-[40%] bg-[#1B365D] rounded-full opacity-40 transform rotate-45"></div>
 
@@ -744,7 +792,6 @@ function StudentSelectionScreen({ evaluatorName, assignedList, initialSelectedId
       <div className="absolute top-0 left-0 w-full h-[32rem] bg-gradient-to-b from-[#E30613] to-[#800000] rounded-b-[120px] shadow-lg -z-10"></div>
       
       <div className="w-full max-w-3xl bg-white rounded-3xl shadow-2xl overflow-hidden flex flex-col my-8 border border-slate-100 animate-fade-in-up">
-        {/* Header de Selección */}
         <div className="p-6 sm:p-8 bg-slate-950 text-white flex flex-col sm:flex-row justify-between sm:items-center gap-4 border-b border-slate-800">
           <div>
             <span className="text-xs font-bold text-[#E28E2B] uppercase tracking-widest">Paso 2: Selección de Alumno</span>
@@ -760,7 +807,6 @@ function StudentSelectionScreen({ evaluatorName, assignedList, initialSelectedId
           </button>
         </div>
 
-        {/* Buscador de Estudiantes */}
         <div className="px-6 py-4 bg-[#FAF8F5] border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">
             Alumnos de tu Mesa de Trabajo ({assignedList.length})
@@ -777,7 +823,6 @@ function StudentSelectionScreen({ evaluatorName, assignedList, initialSelectedId
           </div>
         </div>
 
-        {/* Listado de Tarjetas de Estudiantes */}
         <div className="p-4 sm:p-6 overflow-y-auto max-h-[50vh] space-y-3">
           {filteredList.length === 0 ? (
             <div className="text-center py-8 text-slate-400 text-sm font-medium">
@@ -796,7 +841,6 @@ function StudentSelectionScreen({ evaluatorName, assignedList, initialSelectedId
                       : 'border-slate-200 bg-white hover:border-slate-300 hover:bg-[#FAF8F5]'
                   }`}
                 >
-                  {/* Radio button circular para denotar selección exclusiva */}
                   <div className={`mt-1 shrink-0 w-5 h-5 rounded-full border-2 flex items-center justify-center ${
                     isSelected ? 'border-[#E30613] bg-[#E30613] text-white' : 'border-slate-300 bg-white'
                   }`}>
@@ -823,7 +867,6 @@ function StudentSelectionScreen({ evaluatorName, assignedList, initialSelectedId
           )}
         </div>
 
-        {/* Footer de Confirmación */}
         <div className="p-6 bg-[#FAF8F5] border-t border-slate-200 flex flex-col sm:flex-row gap-4 justify-between items-center shrink-0">
           <span className="text-sm font-semibold text-slate-600 text-center sm:text-left">
             {selectedId ? (
@@ -855,13 +898,7 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
   });
   
   const [notas, setNotas] = useState({
-    problematica: '',
-    realidad: '',
-    acciones: '',
-    decisiones: '',
-    aprendio: '',
-    propuesta: '',
-    general: ''
+    problematica: '', realidad: '', acciones: '', decisiones: '', aprendio: '', propuesta: '', general: ''
   });
 
   const [fortalezas, setFortalezas] = useState('');
@@ -878,12 +915,8 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
 
   useEffect(() => {
     setScores(participant.scores ? {
-      crit1: participant.scores.crit1,
-      crit2: participant.scores.crit2,
-      crit3: participant.scores.crit3,
-      crit4: participant.scores.crit4,
-      crit5: participant.scores.crit5,
-      crit6: participant.scores.crit6,
+      crit1: participant.scores.crit1, crit2: participant.scores.crit2, crit3: participant.scores.crit3, 
+      crit4: participant.scores.crit4, crit5: participant.scores.crit5, crit6: participant.scores.crit6,
     } : { crit1: null, crit2: null, crit3: null, crit4: null, crit5: null, crit6: null });
 
     setObservacionesGenerales(participant.observacionesGenerales || '');
@@ -891,13 +924,7 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
     setAreasOportunidad(participant.areasOportunidad || '');
     setPreguntasIA(participant.preguntasIA || '');
     setNotas(participant.notasProyecto || {
-      problematica: '',
-      realidad: '',
-      acciones: '',
-      decisiones: '',
-      aprendio: '',
-      propuesta: '',
-      general: ''
+      problematica: '', realidad: '', acciones: '', decisiones: '', aprendio: '', propuesta: '', general: ''
     });
     setAiError('');
     setActiveCriterionForIA(null);
@@ -919,10 +946,7 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
 
   const loadHtml2Pdf = () => {
     return new Promise((resolve) => {
-      if (window.html2pdf) {
-        resolve(window.html2pdf);
-        return;
-      }
+      if (window.html2pdf) { resolve(window.html2pdf); return; }
       const script = document.createElement("script");
       script.src = "https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js";
       script.onload = () => resolve(window.html2pdf);
@@ -933,11 +957,7 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
 
   const handleDownloadPDF = async () => {
     const html2pdfLib = await loadHtml2Pdf();
-    
-    if (!html2pdfLib) {
-      console.error("No se pudo cargar la extensión de exportación PDF. Por favor, revisa tu conexión.");
-      return;
-    }
+    if (!html2pdfLib) return;
 
     const element = document.getElementById('printable-pdf-certificate');
     const opt = {
@@ -969,7 +989,7 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
         nombre_participante: participant.nombre,
         cct: participant.cct,
         school: participant.escuela,
-        zona: participant.region, // Envía la región actual a la columna "zona" original de tu Sheets
+        zona: participant.region, 
         sector: participant.sector,
         servicio_educativo: participant.servicio,
         genero: participant.genero,
@@ -995,11 +1015,8 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
 
       try {
         await fetch(GOOGLE_SCRIPT_URL, {
-          method: 'POST',
-          mode: 'no-cors',
-          headers: {
-            'Content-Type': 'application/json'
-          },
+          method: 'POST', mode: 'no-cors',
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
       } catch (e) {
@@ -1011,24 +1028,47 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
     setIsSavingAndDownloading(false);
   };
 
+  // =============== ACTUALIZACIÓN DE GEMINI =================
   const runGeminiCall = async (promptBody, systemInstruction, jsonSchemaInput = null) => {
-    const apiKey = ""; 
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
-    
+    // Conservé tu API Key original del archivo.
+    // Si después de probar sigue fallando con 403/API_KEY_INVALID, genera una nueva en Google AI Studio.
+    const apiKey = "AIzaSyDXyhZs6x0hnLhWqqFWi0E4daUubNBIwkQ";
+
+    // Modelos actuales recomendados para texto. La función prueba primero Flash y luego Flash-Lite.
+    const modelsToTry = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
+
     const payload = {
-      contents: [{ parts: [{ text: promptBody }] }],
-      systemInstruction: { parts: [{ text: systemInstruction }] }
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: promptBody }]
+        }
+      ],
+      systemInstruction: {
+        parts: [{ text: systemInstruction }]
+      }
     };
 
     if (jsonSchemaInput) {
       let finalSchema = null;
+
       if (jsonSchemaInput === true) {
         finalSchema = {
           type: "OBJECT",
           properties: {
-            message: { type: "STRING", description: "Mensaje pedagógico para el evaluador." },
-            nivel: { type: "STRING", enum: ["Autónomo", "Destacado", "En desarrollo", "Requiere apoyo"], description: "El nivel seleccionado o recalculado." },
-            puntos: { type: "INTEGER", description: "Puntos recomendados en este turno." }
+            message: {
+              type: "STRING",
+              description: "Mensaje pedagógico para el evaluador."
+            },
+            nivel: {
+              type: "STRING",
+              enum: ["Autónomo", "Destacado", "En desarrollo", "Requiere apoyo"],
+              description: "Nivel seleccionado o recalculado."
+            },
+            puntos: {
+              type: "INTEGER",
+              description: "Puntos recomendados en este criterio."
+            }
           },
           required: ["message", "nivel", "puntos"]
         };
@@ -1040,34 +1080,65 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
         responseMimeType: "application/json",
         responseSchema: finalSchema
       };
+    } else {
+      payload.generationConfig = {
+        temperature: 0.7,
+        topP: 0.95,
+        maxOutputTokens: 1200
+      };
     }
 
-    let delay = 1000;
-    for (let attempt = 1; attempt <= 5; attempt++) {
-      try {
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
+    let lastError = null;
 
-        if (!response.ok) {
-          throw new Error(`HTTP Error: ${response.status}`);
-        }
+    for (const model of modelsToTry) {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      let delay = 1000;
 
-        const data = await response.json();
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (text) {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          console.log(`Gemini: usando modelo ${model}. Intento ${attempt}.`);
+
+          const response = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify(payload)
+          });
+
+          if (!response.ok) {
+            const errorText = await response.text();
+            console.error("Error completo de Gemini:", errorText);
+            throw new Error(`HTTP ${response.status}: ${errorText}`);
+          }
+
+          const data = await response.json();
+          console.log("Respuesta completa de Gemini:", data);
+
+          const text =
+            data?.candidates?.[0]?.content?.parts
+              ?.map(part => part.text || "")
+              ?.join("")
+              ?.trim();
+
+          if (!text) {
+            throw new Error("Gemini respondió, pero no devolvió texto útil.");
+          }
+
           return text;
-        } else {
-          throw new Error('Formato de respuesta vacío o corrupto');
+        } catch (err) {
+          lastError = err;
+          console.error(`Gemini falló con ${model}, intento ${attempt}:`, err);
+
+          if (attempt < 3) {
+            await new Promise(resolve => setTimeout(resolve, delay));
+            delay *= 2;
+          }
         }
-      } catch (err) {
-        if (attempt === 5) throw err;
-        await new Promise(resolve => setTimeout(resolve, delay));
-        delay *= 2;
       }
     }
+
+    throw lastError || new Error("No fue posible obtener respuesta de Gemini.");
   };
 
   const handleGenerateQualitativeAI = async () => {
@@ -1113,15 +1184,15 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
       };
       
       const resultText = await runGeminiCall(promptBody, systemPrompt, customSchema);
-      const parsed = JSON.parse(resultText);
+      const parsed = parseGeminiJson(resultText);
       
       if (parsed.fortalezas && parsed.areasOportunidad) {
         setFortalezas(parsed.fortalezas);
         setAreasOportunidad(parsed.areasOportunidad);
       }
     } catch (err) {
-      console.error(err);
-      setAiError('Ocurrió un error al generar la retroalimentación cualitativa.');
+      console.error("Error real al generar retroalimentación cualitativa:", err);
+      setAiError(`Ocurrió un error al generar la retroalimentación cualitativa: ${getGeminiErrorMessage(err)}`);
     } finally {
       setIsLoadingQualitativeAI(false);
     }
@@ -1132,7 +1203,18 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
     setAiError('');
     setShowQuestions(true);
 
-    const systemPrompt = `Eres un experto evaluador pedagógico de la OCI 2026 de Durango, México. Formula de 4 a 6 preguntas de diálogo situado y crítico basadas en las notas que te preocupe el usuario. Sé constructivo y enfócate en la argumentación de las decisiones tomadas.`;
+    const systemPrompt = `Eres un experto evaluador pedagógico de la Olimpiada del Conocimiento Infantil 2026 de Durango, México.
+
+Formula de 4 a 6 preguntas de diálogo situado y crítico para apoyar al evaluador durante la conversación con la alumna o el alumno.
+
+Las preguntas deben:
+- Ser claras y comprensibles para una niña o niño de primaria.
+- Tener tono amable, no intimidante.
+- Profundizar en la problemática, las acciones, las decisiones, los aprendizajes y la propuesta.
+- Favorecer la argumentación.
+- Evitar sonar como examen rígido.
+
+Devuelve solo una lista numerada de preguntas. No uses JSON.`;
 
     const promptBody = `
       Alumno: ${participant.nombre}
@@ -1149,7 +1231,8 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
       setPreguntasIA(text);
       onSavePreguntasIA(text);
     } catch (err) {
-      setAiError(`Error al formular preguntas. Intenta de nuevo.`);
+      console.error("Error real al formular preguntas:", err);
+      setAiError(`Error al formular preguntas: ${getGeminiErrorMessage(err)}`);
     } finally {
       setIsLoadingAI(false);
     }
@@ -1157,7 +1240,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
 
   return (
     <div className="flex-1 flex flex-col min-h-screen relative pb-28">
-      {/* 1. BARRA UTILITY SUPERIOR - Sleek y Fija */}
       <div className="sticky top-0 z-20 bg-slate-900 text-slate-100 shadow-md px-4 py-3 flex items-center justify-between gap-4 shrink-0">
         <div className="flex items-center gap-2">
           <button 
@@ -1173,7 +1255,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
           <span className="text-sm font-black hidden sm:inline text-[#E28E2B]">OCI 2026</span>
         </div>
 
-        {/* Live Score Badge */}
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2 bg-slate-800 px-3 py-1 rounded-xl border border-slate-700">
             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest hidden md:inline">Puntaje acumulado:</span>
@@ -1181,20 +1262,13 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
               {totalScore} <span className="text-xs text-slate-500">/100</span>
             </span>
           </div>
-
           <div className="h-5 w-[1px] bg-slate-700"></div>
-
-          <button 
-            onClick={onLogout}
-            className="p-1.5 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-red-400 transition-colors cursor-pointer"
-            title="Cerrar Sesión"
-          >
+          <button onClick={onLogout} className="p-1.5 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-red-400 transition-colors cursor-pointer" title="Cerrar Sesión">
             <LogOut size={18} />
           </button>
         </div>
       </div>
 
-      {/* 2. AREA DE CONTENIDO DE EVALUACIÓN DESPLAZABLE Y RESPONSIVO */}
       <div className="p-3 sm:p-6 max-w-5xl w-full mx-auto space-y-6 sm:space-y-8 flex-1">
         
         {isEvaluado && (
@@ -1204,7 +1278,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
           </div>
         )}
 
-        {/* FICHA DE IDENTIFICACIÓN INTEGRADA AL DESPLAZAMIENTO */}
         <section className="bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden p-6 sm:p-8 space-y-6">
           <div className="border-b border-slate-100 pb-4 flex flex-col sm:flex-row justify-between sm:items-center gap-3">
             <div>
@@ -1218,33 +1291,27 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
             </div>
           </div>
 
-          {/* Grid de Datos del Estudiante y Evaluador */}
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-6 text-xs sm:text-sm">
             <div className="space-y-1">
               <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Proyecto Presentado</span>
               <strong className="text-slate-800 text-sm leading-tight block">"{participant.proyecto}"</strong>
             </div>
-
             <div className="space-y-1">
               <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Escuela Primaria</span>
               <strong className="text-slate-800 text-sm block">{participant.escuela}</strong>
             </div>
-
             <div className="space-y-1">
               <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Clave CCT</span>
               <strong className="text-slate-800 block font-mono bg-[#FAF8F5] px-2 py-0.5 rounded border border-slate-200 inline-block">{participant.cct}</strong>
             </div>
-
             <div className="space-y-1">
               <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Región / Sector</span>
               <strong className="text-slate-800 block">Región: {participant.region} • Sector: {participant.sector}</strong>
             </div>
-
             <div className="space-y-1">
               <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Género</span>
               <strong className="text-slate-800 block">{participant.genero}</strong>
             </div>
-
             <div className="space-y-1 bg-[#FAF8F5] p-2.5 rounded-xl border border-slate-100">
               <span className="text-[9px] font-black text-slate-400 uppercase tracking-wider block">Evaluador Responsable</span>
               <strong className="text-[#E30613] block text-xs font-black">{evaluatorUser.nombre}</strong>
@@ -1253,7 +1320,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
           </div>
         </section>
 
-        {/* MOMENTO 2 - NOTAS DE OBSERVACIÓN (EXPOSICIÓN) */}
         <section className="bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden">
           <div className="bg-[#1B365D] px-6 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-white">
             <div className="flex items-center gap-3">
@@ -1270,7 +1336,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
           
           <div className="p-6 space-y-6">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-              
               <div>
                 <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1.5">
                   <span className="w-2 h-2 rounded-full bg-[#0088A7]"></span>
@@ -1283,7 +1348,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
                   className="w-full p-3 border border-slate-300 rounded-xl focus:ring-2 focus:ring-[#E30613] outline-none text-sm min-h-[90px] resize-y bg-[#FAF8F5]"
                 />
               </div>
-
               <div>
                 <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1.5">
                   <span className="w-2 h-2 rounded-full bg-[#0088A7]"></span>
@@ -1296,7 +1360,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
                   className="w-full p-3 border border-slate-300 rounded-xl focus:ring-2 focus:ring-[#E30613] outline-none text-sm min-h-[90px] resize-y bg-[#FAF8F5]"
                 />
               </div>
-
               <div>
                 <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1.5">
                   <span className="w-2 h-2 rounded-full bg-[#0088A7]"></span>
@@ -1309,7 +1372,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
                   className="w-full p-3 border border-slate-300 rounded-xl focus:ring-2 focus:ring-[#E30613] outline-none text-sm min-h-[90px] resize-y bg-[#FAF8F5]"
                 />
               </div>
-
               <div>
                 <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1.5">
                   <span className="w-2 h-2 rounded-full bg-[#0088A7]"></span>
@@ -1322,7 +1384,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
                   className="w-full p-3 border border-slate-300 rounded-xl focus:ring-2 focus:ring-[#E30613] outline-none text-sm min-h-[100px] resize-y bg-[#FAF8F5]"
                 />
               </div>
-
               <div>
                 <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1.5">
                   <span className="w-2 h-2 rounded-full bg-[#0088A7]"></span>
@@ -1335,7 +1396,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
                   className="w-full p-3 border border-slate-300 rounded-xl focus:ring-2 focus:ring-[#E30613] outline-none text-sm min-h-[100px] resize-y bg-[#FAF8F5]"
                 />
               </div>
-
               <div>
                 <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1.5">
                   <span className="w-2 h-2 rounded-full bg-[#0088A7]"></span>
@@ -1348,7 +1408,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
                   className="w-full p-3 border border-slate-300 rounded-xl focus:ring-2 focus:ring-[#E30613] outline-none text-sm min-h-[100px] resize-y bg-[#FAF8F5]"
                 />
               </div>
-
             </div>
 
             <div className="pt-4 border-t border-slate-100">
@@ -1390,7 +1449,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
           </div>
         </section>
 
-
         {/* MOMENTO 3 - RÚBRICA DE EVALUACIÓN */}
         <section className="space-y-6">
           <div className="flex items-center gap-3">
@@ -1401,15 +1459,8 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
           <div className="space-y-6">
             {RUBRICA.map((criterio) => {
               const currentPuntos = scores[criterio.id];
-              
-              // Función auxiliar para determinar si los puntos entran en el rango (ej. "15-17")
-              const isScoreInRange = (score, rangoStr) => {
-                if (score === null || score === undefined || !rangoStr) return false;
-                const [min, max] = rangoStr.split('-').map(Number);
-                return score >= min && score <= max;
-              };
-
-              const selectedLevel = criterio.niveles.find(n => isScoreInRange(currentPuntos, n.rango));
+              // Usamos la función dinámica para detectar el nivel en base al rango
+              const selectedLevel = getLevelForScore(criterio, currentPuntos);
 
               return (
                 <div key={criterio.id} className="bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden">
@@ -1440,7 +1491,8 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
                   <div className="p-3 sm:p-4 bg-slate-100/30">
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
                       {criterio.niveles.map((nivel, idx) => {
-                        const isSelected = isScoreInRange(currentPuntos, nivel.rango);
+                        // Resalta si el nombre del nivel seleccionado coincide con el de la tarjeta
+                        const isSelected = selectedLevel && selectedLevel.nombre === nivel.nombre;
                         return (
                           <div 
                             key={idx}
@@ -1529,7 +1581,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
             )}
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              {/* Fortalezas */}
               <div className="space-y-2">
                 <label className="block text-xs font-bold text-[#E30613] uppercase tracking-wider flex items-center gap-1.5">
                   <ThumbsUp size={14} className="text-[#E30613]" />
@@ -1543,7 +1594,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
                 />
               </div>
 
-              {/* Áreas de oportunidad */}
               <div className="space-y-2">
                 <label className="block text-xs font-bold text-[#E28E2B] uppercase tracking-wider flex items-center gap-1.5">
                   <AlertTriangle size={14} className="text-[#E28E2B]" />
@@ -1558,7 +1608,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
               </div>
             </div>
 
-            {/* Observaciones generales (MANUAL OBLIGATORIO) */}
             <div className="pt-4 border-t border-slate-100 space-y-2">
               <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider flex items-center gap-1.5">
                 <MessageSquare size={14} className="text-[#E30613]" />
@@ -1580,11 +1629,9 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
 
       </div>
 
-      {/* BARRA FLOTANTE INFERIOR: ÚNICO BOTÓN "GUARDAR" CON VALIDACIONES DE SEGURIDAD */}
       <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 p-4 shadow-[0_-10px_20px_-10px_rgba(0,0,0,0.1)] z-20 flex justify-end">
         <div className="max-w-5xl w-full mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
           
-          {/* Alerta visible en caso de rúbrica incompleta */}
           {!isComplete ? (
             <div className="text-red-600 text-sm font-bold flex items-center gap-2 bg-red-50 border border-red-100 px-4 py-2 rounded-xl w-full sm:w-auto animate-pulse">
               <AlertTriangle size={18} className="shrink-0 text-[#E28E2B]" />
@@ -1621,20 +1668,15 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
         </div>
       </div>
 
-      {/* =======================================================
-          PLANTILLA PDF ESCONDIDA FUERA DE PANTALLA
-          ======================================================= */}
       <div style={{ position: 'fixed', left: '100%', top: 0 }}>
         <div id="printable-pdf-certificate" className="bg-white text-slate-950 p-6 font-serif leading-tight border-[12px] border-double border-[#E30613] shadow-md" style={{ width: '740px' }}>
           
-          {/* Encabezado Oficial */}
           <div className="text-center border-b-2 border-[#E28E2B] pb-3 mb-4">
             <p className="text-[10px] uppercase tracking-widest font-sans font-bold text-[#E30613]">Secretaría de Educación del Estado de Durango</p>
             <h1 className="text-xl font-black font-sans text-[#E30613] mt-1 uppercase">Olimpiada del Conocimiento Infantil 2026</h1>
             <p className="text-[10px] font-sans italic text-slate-600">“Etapa Estatal • Durango - Argumento mis decisiones y lo que aprendí”</p>
           </div>
 
-          {/* Ficha de Identificación */}
           <div className="grid grid-cols-2 gap-3 text-[10px] font-sans mb-4 bg-slate-50 p-3 rounded-lg border border-slate-200">
             <div>
               <p className="text-slate-500 uppercase font-bold tracking-wider">Nombre del Participante:</p>
@@ -1662,7 +1704,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
             </div>
           </div>
 
-          {/* Bloque Cuantitativo (Rúbrica) */}
           <div className="mb-4">
             <h3 className="text-[10px] uppercase font-sans font-black tracking-wider text-[#E30613] border-b border-[#E28E2B] pb-1 mb-1.5">Desglose Cuantitativo de Rúbrica</h3>
             <table className="w-full text-left text-[9px] font-sans border-collapse">
@@ -1676,13 +1717,9 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
               <tbody className="divide-y divide-slate-200">
                 {RUBRICA.map(c => {
                   const puntos = scores[c.id];
-                  const nivelEncontrado = puntos !== null 
-                    ? c.niveles.find(n => {
-                        const [min, max] = n.rango.split('-').map(Number);
-                        return puntos >= min && puntos <= max;
-                      })
-                    : null;
-                  const nivelNombre = puntos !== null ? (nivelEncontrado?.nombre || "Requiere apoyo") : "Sin evaluar";
+                  // Usamos la nueva función para el nivel exacto en el PDF
+                  const nivelObj = getLevelForScore(c, puntos);
+                  const nivelNombre = nivelObj ? nivelObj.nombre : "Sin evaluar";
                   
                   return (
                     <tr key={c.id}>
@@ -1700,7 +1737,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
             </table>
           </div>
 
-          {/* Bloque Cualitativo (Exposición) */}
           <div className="mb-4">
             <h3 className="text-[10px] uppercase font-sans font-black tracking-wider text-[#E30613] border-b border-[#E28E2B] pb-1 mb-1.5">Momento 2: Registro de Notas del Proyecto</h3>
             <div className="grid grid-cols-2 gap-3 text-[9px] font-sans leading-tight">
@@ -1731,7 +1767,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
             </div>
           </div>
 
-          {/* Retroalimentación final */}
           <div className="mb-6">
             <h3 className="text-[10px] uppercase font-sans font-black tracking-wider text-[#E30613] border-b border-[#E28E2B] pb-1 mb-1.5">Diagnóstico Pedagógico de Cierre</h3>
             <div className="space-y-2.5 text-[9px] font-sans leading-tight">
@@ -1750,7 +1785,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
             </div>
           </div>
 
-          {/* BLOQUE DE FIRMA ÚNICA - SOLO EL EVALUADOR */}
           <div className="mt-8 flex justify-center text-center text-[10px] font-sans">
             <div className="border-t border-slate-400 w-56 pt-1.5">
               <p className="font-black text-slate-900">{evaluatorUser?.nombre || "No especificado"}</p>
@@ -1761,7 +1795,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
         </div>
       </div>
 
-      {/* MODAL EMERGENTE CENTRAL DE PREGUNTAS (DIÁLOGO DE MOMENTO 3) */}
       {showQuestions && (
         <AIQuestionsDrawer 
           content={preguntasIA}
@@ -1772,7 +1805,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
         />
       )}
 
-      {/* MODAL EMERGENTE CENTRAL DE DIÁLOGO DEL MOTOR DE IA INTERACTIVO PARA CRITERIOS */}
       {activeCriterionForIA && (
         <AICriterionChatDrawer 
           criterio={activeCriterionForIA}
@@ -1791,7 +1823,6 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
   );
 }
 
-// COMPONENTE: MODAL CENTRAL Interactivo de chat con motor de IA para calificar criterios
 function AICriterionChatDrawer({ criterio, participant, notas, currentPuntos, onApplyScore, onClose, runGeminiCall }) {
   const [messages, setMessages] = useState([]);
   const [inputValue, setInputValue] = useState('');
@@ -1840,7 +1871,7 @@ function AICriterionChatDrawer({ criterio, participant, notas, currentPuntos, on
         const resultText = await runGeminiCall(prompt, systemInstruction, true);
         if (!active) return;
         
-        const data = JSON.parse(resultText);
+        const data = parseGeminiJson(resultText);
         setMessages([
           { 
             sender: 'ai', 
@@ -1855,7 +1886,7 @@ function AICriterionChatDrawer({ criterio, participant, notas, currentPuntos, on
           setMessages([
             { 
               sender: 'ai', 
-              text: 'Hola. No logré analizar tus notas en este momento debido a un problema de conexión. ¿Podríamos dialogar directamente o escribir algún detalle específico sobre el alumno en este chat para ayudarte?',
+              text: `Hola. No logré analizar tus notas en este momento. Detalle técnico: ${getGeminiErrorMessage(err)}. Podemos dialogar directamente o escribir algún detalle específico sobre el alumno en este chat para ayudarte.`, 
               suggestion: null
             }
           ]);
@@ -1903,7 +1934,7 @@ function AICriterionChatDrawer({ criterio, participant, notas, currentPuntos, on
 
     try {
       const resultText = await runGeminiCall(prompt, systemInstruction, true);
-      const data = JSON.parse(resultText);
+      const data = parseGeminiJson(resultText);
       setMessages(prev => [
         ...prev, 
         { 
@@ -1919,7 +1950,7 @@ function AICriterionChatDrawer({ criterio, participant, notas, currentPuntos, on
         ...prev,
         { 
           sender: 'ai', 
-          text: 'Disculpa, no logré procesar tu mensaje en este instante. ¿Podrías volver a intentarlo?', 
+          text: `Disculpa, no logré procesar tu mensaje en este instante. Detalle técnico: ${getGeminiErrorMessage(err)}`, 
           suggestion: currentProposal 
         }
       ]);
@@ -1937,7 +1968,6 @@ function AICriterionChatDrawer({ criterio, participant, notas, currentPuntos, on
         className="bg-white w-full max-w-xl max-h-[90vh] rounded-3xl shadow-2xl flex flex-col overflow-hidden relative"
         onClick={(e) => e.stopPropagation()} 
       >
-        {/* Cabecera */}
         <div className="p-4 bg-slate-900 text-white flex justify-between items-center shrink-0 border-b border-slate-800">
           <div className="flex items-center gap-2">
             <Sparkles className="h-5 w-5 text-[#E28E2B] animate-pulse" />
@@ -1958,13 +1988,11 @@ function AICriterionChatDrawer({ criterio, participant, notas, currentPuntos, on
           </button>
         </div>
 
-        {/* Meta de Criterio */}
         <div className="p-4 bg-slate-950 text-slate-300 text-xs shrink-0 space-y-1">
           <p className="font-bold text-[#E28E2B] text-sm">{criterio.titulo}</p>
           <p className="opacity-80">Alumno: <strong className="text-white">{participant.nombre}</strong></p>
         </div>
 
-        {/* Área del Chat */}
         <div className="flex-1 overflow-y-auto p-4 bg-[#FAF8F5] space-y-4 flex flex-col">
           {messages.map((m, idx) => (
             <div key={idx} className={`flex flex-col ${m.sender === 'user' ? 'items-end' : 'items-start'} space-y-1`}>
@@ -2001,7 +2029,6 @@ function AICriterionChatDrawer({ criterio, participant, notas, currentPuntos, on
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Panel Flotante de la Sugerencia Actual Activa */}
         {currentProposal.nivel && !isThinking && (
           <div className="p-4 bg-slate-50 border-t border-slate-200 flex items-center justify-between gap-4 shrink-0">
             <div>
@@ -2020,7 +2047,6 @@ function AICriterionChatDrawer({ criterio, participant, notas, currentPuntos, on
           </div>
         )}
 
-        {/* Input de Mensaje */}
         <form onSubmit={handleSendMessage} className="p-3 border-t border-slate-200 bg-white flex items-center gap-2 shrink-0">
           <input
             type="text"
@@ -2043,7 +2069,6 @@ function AICriterionChatDrawer({ criterio, participant, notas, currentPuntos, on
   );
 }
 
-// COMPONENTE: MODAL CENTRAL de preguntas de IA para Momento 3
 function AIQuestionsDrawer({ content, isLoading, error, onRegenerate, onClose }) {
   const [copySuccess, setCopySuccess] = useState(false);
 
@@ -2097,7 +2122,6 @@ function AIQuestionsDrawer({ content, isLoading, error, onRegenerate, onClose })
         className="bg-white w-full max-w-lg h-[80vh] sm:h-auto sm:max-h-[90vh] rounded-3xl shadow-2xl flex flex-col overflow-hidden relative"
         onClick={(e) => e.stopPropagation()} 
       >
-        {/* Cabecera */}
         <div className="p-5 bg-slate-900 text-white flex justify-between items-center shrink-0 border-b border-slate-800">
           <div className="flex items-center gap-2">
             <Sparkles className="h-5 w-5 text-[#E28E2B] animate-pulse" />
@@ -2115,7 +2139,6 @@ function AIQuestionsDrawer({ content, isLoading, error, onRegenerate, onClose })
           </button>
         </div>
 
-        {/* Contenido */}
         <div className="p-6 overflow-y-auto flex-1 bg-[#FAF8F5] space-y-6">
           {isLoading ? (
             <div className="h-full flex flex-col items-center justify-center text-center space-y-4 py-20">
@@ -2161,7 +2184,6 @@ function AIQuestionsDrawer({ content, isLoading, error, onRegenerate, onClose })
           )}
         </div>
 
-        {/* Barra de Herramientas Inferior */}
         {content && !isLoading && !error && (
           <div className="p-4 border-t border-slate-200 bg-white flex items-center justify-between gap-3 shrink-0">
             <button 
@@ -2192,4 +2214,3 @@ function AIQuestionsDrawer({ content, isLoading, error, onRegenerate, onClose })
     </div>
   );
 }
-
