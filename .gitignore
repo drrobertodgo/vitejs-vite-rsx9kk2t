@@ -12,6 +12,12 @@ dist
 dist-ssr
 *.local
 
+# Variables de entorno (contienen la API Key, NUNCA subir a git)
+.env
+.env.*
+!.env.example
+.vercel
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

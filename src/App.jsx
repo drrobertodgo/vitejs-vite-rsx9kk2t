@@ -1029,116 +1029,35 @@ function EvaluationForm({ participant, evaluatorUser, onSave, onSavePreguntasIA,
   };
 
   // =============== ACTUALIZACIÓN DE GEMINI =================
+  // La API Key ya NO vive en el navegador. Esta función llama a nuestro
+  // backend (/api/gemini), que es quien guarda la clave y habla con Gemini.
+  // Los modelos, el payload y los reintentos se manejan ahora en el servidor
+  // (ver api/_gemini-core.js). La firma se mantiene idéntica, así que el
+  // resto de la app sigue funcionando exactamente igual.
   const runGeminiCall = async (promptBody, systemInstruction, jsonSchemaInput = null) => {
-    // Conservé tu API Key original del archivo.
-    // Si después de probar sigue fallando con 403/API_KEY_INVALID, genera una nueva en Google AI Studio.
-    const apiKey = "AQ.Ab8RN6LCGnafIMY5WtvdPEmj3CjKNOxAGawM0f1JqFzXcRrbQA";
+    const response = await fetch("/api/gemini", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ promptBody, systemInstruction, jsonSchemaInput })
+    });
 
-    // Modelos actuales recomendados para texto. La función prueba primero Flash y luego Flash-Lite.
-    const modelsToTry = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
+    const data = await response.json().catch(() => null);
 
-    const payload = {
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: promptBody }]
-        }
-      ],
-      systemInstruction: {
-        parts: [{ text: systemInstruction }]
-      }
-    };
-
-    if (jsonSchemaInput) {
-      let finalSchema = null;
-
-      if (jsonSchemaInput === true) {
-        finalSchema = {
-          type: "OBJECT",
-          properties: {
-            message: {
-              type: "STRING",
-              description: "Mensaje pedagógico para el evaluador."
-            },
-            nivel: {
-              type: "STRING",
-              enum: ["Autónomo", "Destacado", "En desarrollo", "Requiere apoyo"],
-              description: "Nivel seleccionado o recalculado."
-            },
-            puntos: {
-              type: "INTEGER",
-              description: "Puntos recomendados en este criterio."
-            }
-          },
-          required: ["message", "nivel", "puntos"]
-        };
-      } else {
-        finalSchema = jsonSchemaInput;
-      }
-
-      payload.generationConfig = {
-        responseMimeType: "application/json",
-        responseSchema: finalSchema
-      };
-    } else {
-      payload.generationConfig = {
-        temperature: 0.7,
-        topP: 0.95,
-        maxOutputTokens: 1200
-      };
+    if (!response.ok) {
+      // El backend reenvía el mensaje original (API_KEY_INVALID, 403, 429...)
+      // para que getGeminiErrorMessage lo siga clasificando bien.
+      throw new Error(data?.error || `HTTP ${response.status}`);
     }
 
-    let lastError = null;
+    const text = data?.text;
 
-    for (const model of modelsToTry) {
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-      let delay = 1000;
-
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          console.log(`Gemini: usando modelo ${model}. Intento ${attempt}.`);
-
-          const response = await fetch(endpoint, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify(payload)
-          });
-
-          if (!response.ok) {
-            const errorText = await response.text();
-            console.error("Error completo de Gemini:", errorText);
-            throw new Error(`HTTP ${response.status}: ${errorText}`);
-          }
-
-          const data = await response.json();
-          console.log("Respuesta completa de Gemini:", data);
-
-          const text =
-            data?.candidates?.[0]?.content?.parts
-              ?.map(part => part.text || "")
-              ?.join("")
-              ?.trim();
-
-          if (!text) {
-            throw new Error("Gemini respondió, pero no devolvió texto útil.");
-          }
-
-          return text;
-        } catch (err) {
-          lastError = err;
-          console.error(`Gemini falló con ${model}, intento ${attempt}:`, err);
-
-          if (attempt < 3) {
-            await new Promise(resolve => setTimeout(resolve, delay));
-            delay *= 2;
-          }
-        }
-      }
+    if (!text) {
+      throw new Error("Gemini respondió, pero no devolvió texto útil.");
     }
 
-    throw lastError || new Error("No fue posible obtener respuesta de Gemini.");
+    return text;
   };
 
   const handleGenerateQualitativeAI = async () => {
